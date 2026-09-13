@@ -1,7 +1,7 @@
-name: Backend Continuous Integration
+name: Backend Continuous Deployment
 
 on:
-  pull_request:
+  push:
     branches:
       - main
     paths:
@@ -9,7 +9,10 @@ on:
   workflow_dispatch:
 
 env:
-  PYTHON_VERSION: '3.10'
+  PYTHON_VERSION: '3.11'
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: cluster
+  ECR_REPOSITORY: backend
 
 jobs:
   lint:
@@ -76,8 +79,8 @@ jobs:
       - name: Run tests
         run: pipenv run test
 
-  build:
-    name: Build
+  deploy:
+    name: Build and Deploy
     needs: [lint, test]
     runs-on: ubuntu-latest
     defaults:
@@ -87,27 +90,39 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Restore cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/share/virtualenvs
-          key: ${{ runner.os }}-pipenv-${{ hashFiles('starter/backend/Pipfile.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-pipenv-
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Install pipenv
-        run: pip install pipenv
+      - name: Build and push Docker image to ECR
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build --tag $REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG .
+          docker push $REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
 
-      - name: Install dependencies
-        run: pipenv install --dev
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
-      - name: Run tests
-        run: pipenv run test
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
 
-      - name: Build Docker image
-        run: docker build --tag mp-backend:${{ github.sha }} .
+      - name: Deploy to EKS
+        working-directory: starter/backend/k8s
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          kustomize edit set image backend=$REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+          kustomize build | kubectl apply -f -
+          kubectl rollout status deployment/backend --timeout=180s
